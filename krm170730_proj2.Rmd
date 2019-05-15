@@ -1,0 +1,220 @@
+---
+output:
+  pdf_document: default
+  word_document: default
+  html_document: default
+---
+# Project 2 - regression
+
+# Data cleaning and exploration
+
+The first data set I decided to use was a Formula 1 dataset through Ergast, retrieved from here: http://ergast.com/mrd/db/
+
+Ultimately, what I would like my model to do for this data set is predict a given lap's lap time based on total race times, final position, the track, position of driver in the race at time of lap, nationality, the year in which the race took place, constructor, driver age, whether it is the first lap, the driver's fastest lap time for that race, the interaction between final time and track, and whether or not the driver took a pit stop that lap. Obviously, the predictors will be different for different models; for instance kNN works better with fewer dimensions.
+
+The first step in predicting lap times is cleaning up the data. The fields themselves were incredibly messy and some had characters which were not reading properly. The first thing I did was write a python script to clean up certain names and to make all of the codes match so that they can be appropriately divided into factors later in the process.
+
+The data in the database was extensive, but spread throughout 13 different files of different formats, so getting relevant variables into a single data frame was the next step.
+
+To get the relevant data into a single data frame, I first read in all of the CSV files which contained the data I will need to predict on, and to name them appropriately according to the database schema.
+
+```{r}
+laptimes <- read.csv("C:/Users/keato/OneDrive/Documents/School/SP2019/Machine Learning/Project 2/f1db_csv/lap_times.csv",header=FALSE)
+races <- read.csv("C:/Users/keato/OneDrive/Documents/School/SP2019/Machine Learning/Project 2/f1db_csv/races.csv",header=FALSE)
+driver <- read.csv("C:/Users/keato/OneDrive/Documents/School/SP2019/Machine Learning/Project 2/f1db_csv/driver.csv",header=FALSE)
+pitstops <- read.csv("C:/Users/keato/OneDrive/Documents/School/SP2019/Machine Learning/Project 2/f1db_csv/pit_stops.csv",header=FALSE)
+constructors <- read.csv("C:/Users/keato/OneDrive/Documents/School/SP2019/Machine Learning/Project 2/f1db_csv/constructors.csv",header=FALSE)
+race_results<- read.csv("C:/Users/keato/OneDrive/Documents/School/SP2019/Machine Learning/Project 2/f1db_csv/results.csv",header=FALSE)
+```
+
+```{r}
+names(laptimes) <- c("raceId", "driverId", "lap_number", "position", "lap_time", "lap_milliseconds")
+names(races) <- c("raceId", "year", "round", "circuitId", "race name", "date", "start time", "url1")
+names(driver) <- c("driverId", "driverRef", "number", "code", "forename", "surname", "dob", "nationality", "url2")
+names(pitstops) <- c("raceId", "driverId", "stop", "lap_number", "timeOfStop", "pit_duration", "pit_milliseconds")
+names(constructors) <- c("constructorId","constructorRef","constructor_name", "constructor_nationality","constructor_url")
+names(race_results) <- c("resultId","raceId","driverId","constructorId","number","grid","final_position","position_text","position_order","points","laps","time","final_milliseconds")
+```
+
+The files are all organized into structures based on database schemas. Let's take a look at the laptimes dataframe which we will eventually use to make our prediction.
+
+```{r}
+dim(laptimes)
+```
+```{r}
+head(laptimes)
+```
+
+
+So laptimes is 450998 observations with 6 variables, but the table doesn't contain many of the factors I want to use to predict lap times. For instance, there is no information on pitstops or constructors here, or any information telling us which year the lap took place in. Let's take a look at the races dataframe.
+
+```{r}
+dim(races)
+```
+```{r}
+head(races)
+```
+
+
+Here we have a list of the individual races. You'll notice that this table is much smaller; only 1018 observations, or 1018 races. Now our challenge is to merge these tables in a way where the laptimes dataframe contains the year and other relevant info for every single row in laptimes so that we can use those variables in our predictions. Mindlessly merging tables won't get us the result we want, however. For instance, this is further complicated by the fact that a driver can drive for multiple constructors over the course of his career. Special care needs to be taken to preserve the data we need.
+
+The solution to our problem here is to use R's merge() function. What this function does is merge tables on certain key attributes. In the case of the laptimes and races tables, the common variable would be raceId. What merge would do in this case is add all of the columns of races to a row in laptimes where the raceIds match. It is functionally equivalent to a join in database systems. In this code chunk, I'll merge all of the data we need into laptimes so that I can begin to operate on it, and remove some columns we won't be using.
+
+```{r}
+constructors[c(2, 4, 5)] <- list(NULL)
+race_results[c(1, 5, 6, 8:12, 14:18)] <- list(NULL)
+
+laptimes <- merge(laptimes, driver, by="driverId")
+laptimes <- merge(laptimes, races, by="raceId")
+laptimes <- merge(laptimes, pitstops, all.x=TRUE)
+laptimes <- merge(laptimes, race_results, by=c("raceId","driverId"))
+laptimes <- merge(laptimes, constructors)
+
+laptimes[c(8:12, 15, 17, 19, 20:24, 29)] <- list(NULL)
+```
+
+Now that everything has been merged, let's take another look at laptimes.
+
+```{r}
+dim(laptimes)
+```
+```{r}
+head(laptimes)
+```
+
+You can see now that laptimes contains all of the proper variables! This is great, now we can get ready to operate on it. The next step is to designate factors to the variables which have different levels. We'll also add a column called pit_stop which is a factor 0 or 1 based on whether a lap has a pit_duration. Finally, I'm going to add a factor which separates years 3 at a time. We'll use this factor to predict lap times, but I'm hoping that a 3 year factor will help to expand the number of samples for each unit of year that we use in our prediction. It will allow us more data for each track, for instance, since a track only hosts one event per year. I will also clean up the data set a bit more here and get rid of a significant number of rows which do not have data necessary for our prediction.
+
+```{r}
+# convert dob column to just year for simple age calculation
+laptimes$dob <- as.Date(laptimes$dob, "%m/%d/%Y")
+laptimes$dob <- as.integer(substring(laptimes$dob, 1, 4))
+
+# convert from factor to integer
+laptimes$final_milliseconds <- as.integer(as.character(laptimes$final_milliseconds))
+laptimes$final_position <- as.integer(as.character(laptimes$final_position))
+
+# create new columns for age, and factor columns for whether or not the lap is the first lap or there has been a pit stop
+laptimes$age <- (laptimes$year - laptimes$dob)
+laptimes$pit_stop <- (ifelse(is.na(laptimes$pit_duration), FALSE, TRUE))
+laptimes$first_lap <- (ifelse(laptimes$lap_number==1, TRUE, FALSE))
+
+# add a factor column year_split which contains groups of 3 years, depending on the year the lap was run
+laptimes$year_split <- as.factor(findInterval(laptimes$year, c(1996, 1999, 2002, 2005, 2008, 2011, 2014)))
+
+laptimes[c(12, 13)] <- list(NULL)
+
+# remove many old laps with incomplete data
+laptimes <- na.omit(laptimes)
+
+head(laptimes)
+```
+
+The separation of 3 years is important because some VERY impactful changes made their way into Formula 1. For instance, in 2011 FIA introduced DRS, a system which allowed higher speed on straights that drastically reduced lap times. The way we are separating into 3 year chunks accounts for many of these changes.
+
+Another huge step I took in the previous code chunk was removing data from before 1996. This is because lap data was not kept for the years 1950-1995, so many of my predictors were not present in laps that took place in those years. This also cut down significantly on computation time because we removed 200k+ rows. Even with our current number (219406), running knn takes a few minutes on my home computer, so removing these rows has made the dataset much less unwieldy.
+
+Let's take a look at the data through some graphs to see if we can better understand it.
+```{r}
+boxplot(laptimes$lap_milliseconds~laptimes$circuitId, xlab="Circuit", ylab="Lap times in ms")
+```
+
+```{r}
+summary(laptimes$lap_milliseconds)
+```
+We can see here that we have some pretty extreme outliers for each given track. Some laps take up to 7506 seconds! That is highly irregular. No average time for any track throughout history is longer than 4 minutes. I'll start by removing laps which take greater than 5 minutes. This doesn't eliminate all of the laps that the boxplot considers outliers, but I don't want to accidentally eliminate a row which could just be a slow lap. 
+
+```{r}
+laptimes <- laptimes[-which(laptimes$lap_milliseconds > 250000),]
+```
+
+Let's see how that's affected our summary.
+```{r}
+summary(laptimes$lap_milliseconds)
+```
+This is much more in line with what we'd expect.
+
+Let's see how our year_split has done in segmenting lap times.
+```{r}
+plot(laptimes$lap_milliseconds~laptimes$year_split)
+```
+
+# Algorithms and analysis
+
+# Linear regression
+
+Now we have our dataframe and we can start running some algorithms. Let's split into train and test and begin with linear regression.
+
+```{r}
+set.seed(1234)
+i <- sample(1:nrow(laptimes), 0.75*nrow(laptimes), replace=FALSE)
+train <- laptimes[i,]
+test <- laptimes[-i,]
+```
+
+Here I've run linear regression with the predictors discussed before. One addition I made was adding a predictor which is an interaction effect between circuitId and the final lap time (final_milliseconds). Since these two values are closely related, I think they help give us a more complete picture.
+```{r}
+# Linear Regression
+lm_laps <- lm(lap_milliseconds~final_milliseconds+final_position+position+nationality+circuitId+constructorId+age+pit_stop+year_split+first_lap+circuitId*final_milliseconds, data = train)
+summary(lm_laps)
+```
+
+The results of linear regression were not great. We see here we have an r-squared value of 0.1784, despite a lot of really decent predictors and a low p-value. It looks like our model is underperforming. Let's make a prediction with it and look at the correlation.
+
+```{r}
+pred <- predict(lm_laps, newdata=test)
+cor(pred, test$lap_milliseconds)
+```
+
+Correlation is scaled between 0 and 1, and the result was really not terrible, but not good either. After many attempts, I can't get linear regression to perform any better, either.
+
+# Regression Tree
+
+Let's try another algorithm: a regression tree.
+```{r}
+library(tree)
+race_tree <- tree(lap_milliseconds~final_milliseconds+final_position+position+circuitId+constructorId+age+pit_stop+year_split+first_lap, data = train)
+plot(race_tree)
+text(race_tree, cex=0.5, pretty=0)
+```
+
+```{r}
+race_pred <- predict(race_tree, newdata = test)
+cor(race_pred, test$lap_milliseconds)
+```
+Our tree has performed significantly better than our linear regression model! Let's see if we can optimize further by pruning.
+
+```{r}
+race_cvtree <- cv.tree(race_tree)
+plot(race_cvtree$size, race_cvtree$dev, type='b')
+text(race_tree, cex=0.5, pretty=0)
+```
+Let's try using best=8 when we prune the tree. This should provide a model which strikes a good balance between overfit and underfit.
+
+```{r}
+tree_pruned <- prune.tree(race_tree, best=8)
+plot(tree_pruned)
+text(race_tree, cex=0.5, pretty=0)
+```
+
+```{r}
+race_pred <- predict(tree_pruned, newdata = test)
+cor(race_pred, test$lap_milliseconds)
+```
+Our pruned tree performs worse than the fully grown tree. This isn't terribly unexpected because fully grown trees tend to overfit data and sometimes outperform pruned trees in general.
+
+Overall we've gotten a much better result with regression trees than with linear regression. One reason this may be is because of the complexity of the data. Trees can outperform regression in cases where more complex data is involved. It also seems to imply that final_milliseconds is one of our best predictors, since that is where the first split occurs.
+
+# kNN
+
+Fianally, we'll run the kNN regression algorithm. I've performed cross-validation separately; it took about 25 minutes to run, so I didn't keep the code in this final result. k=7 performed the best from 3-19 on odd numbers. I've also removed a lot of our predictors and kept only those which I've found to be the most powerful because kNN tends to perform better with fewer dimensions.
+
+```{r}
+library(caret)
+race_knn <- knnreg(lap_milliseconds~final_milliseconds+position+final_position+circuitId, data=train, k=7)
+predictions <- predict(race_knn, test[,c(5, 11:13, 15, 16)])
+cor(predictions, test$lap_milliseconds)
+```
+
+Knn seems to be far outperforming our other models.
+
+Overall kNN performed the best of the three models. I think this is probably because all lap times are pretty tightly packed, since consistency is a core tenet of the sport. Unfortunately, for the same reason I don't think any of our models performed particularly well overall. The nature of Formula 1 races is such that, barring any serious incidents between vehicles, everyone's lap times should be pretty close to eachother, usually within a few seconds seconds. This means that our model couldn't really give us any insight into lap times. In fact, it's very likely that a seasoned fan could guess lap times better than our model, just off the cuff. This makes sense when you think about it; if someone could consistently predict lap times given this data, then they would be doing it. They'd make a fortune gambling on races.
